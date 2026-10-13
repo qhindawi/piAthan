@@ -1,0 +1,20 @@
+[Unit]
+Description=Athan prayer announcement service
+After=network-online.target sound.target
+Wants=network-online.target
+Requires=athan-audio.service
+After=athan-audio.service
+
+[Service]
+Type=simple
+User=qais
+WorkingDirectory=/home/qais/piAthan
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=HOME=/home/qais
+ExecStart=/usr/bin/python3 /home/qais/piAthan/src/athan.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

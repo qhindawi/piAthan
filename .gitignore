@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Runtime state created on the Pi.
+cache/
+logs/
+test/cache/
+test/Logs/
+config/mosque_url.txt
