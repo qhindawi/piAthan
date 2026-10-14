@@ -6,4 +6,6 @@ cache/
 logs/
 test/cache/
 test/Logs/
+test/config/
 config/mosque_url.txt
+config/Fajr_first_athan.json

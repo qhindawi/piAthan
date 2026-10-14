@@ -13,6 +13,7 @@ and the project is installed as one folder in the Pi user's home directory.
 6. Option 2 was selected: the yearly cache is a rolling remainder of the current calendar. At midnight, yesterday and earlier entries are deleted.
 7. The current implementation now refreshes on service startup, rolls the cache at midnight, verifies the current day at 00:01, and retries network operations five times at ten-minute intervals.
 8. A non-leap-year compatibility issue was found: Mawaqit includes a February 29 template entry in 2026. The parser now skips only that invalid optional date during non-leap years.
+9. An optional first-Fajr reminder was added. Its independent setting is stored in `config/Fajr_first_athan.json`, and it uses the existing continuous audio path with `Adhan.mp3`.
 
 ## Next enhancement: screen/status integration
 
@@ -27,6 +28,7 @@ When a screen is added, implement a status publisher without coupling the screen
 5. After the fifth failure, display that the fetch failed completely and that the system will continue using valid cached times when available.
 6. Clear the error state after the next successful fetch.
 7. Add a screen test that simulates each state without requiring internet access.
+8. Add a dashboard setting to show or hide the first-Fajr reminder time. The dashboard should read the reminder configuration and calculated time, but this display preference must not alter whether the reminder is enabled.
 
 ## Other planned improvements
 

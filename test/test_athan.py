@@ -9,7 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, time as clock_time, timedelta
 from pathlib import Path
 
 
@@ -17,6 +17,8 @@ TEST_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = TEST_DIR.parent
 REPORT_DIR = TEST_DIR / "Logs"
 TEST_CACHE_DIR = TEST_DIR / "cache"
+TEST_CONFIG_DIR = TEST_DIR / "config"
+TEST_FAJR_CONFIG = TEST_CONFIG_DIR / "Fajr_first_athan.json"
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
 import athan  # noqa: E402
@@ -25,6 +27,11 @@ from calendar_manager import (  # noqa: E402
     YearCalendarManager,
     fetch_year_calendar,
     get_mosque_url,
+)
+from set_Fajr_first_athan import (  # noqa: E402
+    parse_enabled,
+    parse_minutes,
+    save_settings,
 )
 
 
@@ -78,16 +85,70 @@ def audio_diagnostic() -> str:
     return "\n".join(lines)
 
 
+def configure_test_fajr_first_athan(logger, today_times) -> athan.FajrFirstAthanSettings:
+    TEST_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(athan.TIMEZONE).date()
+
+    while True:
+        try:
+            enabled = parse_enabled(input("Test first Fajr Athan (on/off): "))
+            if enabled:
+                minutes = parse_minutes(
+                    input("Minutes before Fajr: "), enabled
+                )
+            else:
+                minutes = 0
+            break
+        except ValueError as exc:
+            print(f"Invalid setting: {exc}")
+
+    save_settings(enabled, minutes, TEST_FAJR_CONFIG)
+    settings = athan.load_fajr_first_athan_settings(TEST_FAJR_CONFIG)
+    if settings.enabled != enabled or settings.minutes_before_fajr != minutes:
+        raise RuntimeError("test Fajr first Athan configuration was not saved")
+
+    reminder_at = athan.fajr_first_athan_datetime(today_times, today, settings)
+    if enabled:
+        if reminder_at is None:
+            raise RuntimeError("enabled Fajr first Athan time could not be calculated")
+        hour, minute = map(int, today_times["Fajr"].split(":"))
+        official_fajr_at = datetime.combine(
+            today, clock_time(hour, minute), tzinfo=athan.TIMEZONE
+        )
+        if official_fajr_at - reminder_at != timedelta(minutes=minutes):
+            raise RuntimeError("Fajr first Athan offset is incorrect")
+        logger.info(
+            "FAJR_FIRST_ATHAN_TEST_SUCCESS enabled=%s minutes=%d reminder=%s",
+            settings.enabled,
+            settings.minutes_before_fajr,
+            reminder_at.isoformat(),
+        )
+    else:
+        if reminder_at is not None:
+            raise RuntimeError("disabled Fajr first Athan still produced a time")
+        logger.info("FAJR_FIRST_ATHAN_TEST_SUCCESS enabled=false minutes=%d", minutes)
+    return settings
+
+
 def main() -> int:
     logger, report_path = setup_report()
     logger.info("TEST_START report=%s", report_path)
     prayer_argument = sys.argv[1] if len(sys.argv) > 1 else "Fajr"
-    prayer = next(
+    first_fajr_test = prayer_argument.lower() in {
+        "first-fajr",
+        "fajr-first",
+        "fajr-reminder",
+    }
+    prayer = None if first_fajr_test else next(
         (name for name in athan.PRAYERS if name.lower() == prayer_argument.lower()),
         None,
     )
-    if prayer is None:
-        logger.error("Invalid prayer %r; choose one of %s", prayer_argument, athan.PRAYERS)
+    if prayer is None and not first_fajr_test:
+        logger.error(
+            "Invalid prayer %r; choose one of %s or first-fajr",
+            prayer_argument,
+            athan.PRAYERS,
+        )
         return 2
 
     manager = YearCalendarManager(TEST_CACHE_DIR)
@@ -103,6 +164,11 @@ def main() -> int:
         logger.info("ROLLOVER_TEST_SUCCESS times=%s", rollover_times)
         verified_times = manager.verify_today_and_repair()
         logger.info("VERIFICATION_TEST_SUCCESS times=%s", verified_times)
+        reminder_settings = None
+        if first_fajr_test:
+            reminder_settings = configure_test_fajr_first_athan(
+                logger, verified_times
+            )
 
         original_fetch = calendar_module.fetch_year_calendar
         failures = {"count": 0}
@@ -152,15 +218,32 @@ def main() -> int:
         print(f"  {name}: {verified_times[name]}")
     logger.info("TIMES_DISPLAYED schedule=%s", verified_times)
 
-    track = athan.FAJR_TRACK if prayer == "Fajr" else athan.OTHER_TRACK
+    if first_fajr_test:
+        if reminder_settings is None or not reminder_settings.enabled:
+            print("First Fajr Athan reminder is disabled; playback will not start.")
+            logger.info("FAJR_FIRST_ATHAN_PLAYBACK_SKIPPED reason=disabled")
+            return 0
+        today = datetime.now(athan.TIMEZONE).date()
+        reminder_at = athan.fajr_first_athan_datetime(
+            verified_times, today, reminder_settings
+        )
+        if reminder_at is None:
+            raise RuntimeError("Test reminder was unexpectedly disabled")
+        print(f"First Fajr Athan reminder: {reminder_at.strftime('%H:%M')}")
+        logger.info("FAJR_FIRST_ATHAN_TIME_DISPLAYED reminder=%s", reminder_at.isoformat())
+        event_name = athan.FAJR_FIRST_ATHAN_EVENT
+        track = athan.OTHER_TRACK
+    else:
+        event_name = f"{prayer} Athan"
+        track = athan.FAJR_TRACK if prayer == "Fajr" else athan.OTHER_TRACK
     audio = athan.AudioController()
     try:
         if not audio.wait_until_ready():
             raise RuntimeError("athan-audio.service is not ready")
         logger.info("AUDIO_SERVICE_READY socket=%s", athan.CONTROL_SOCKET)
         audio.play(track)
-        logger.info("AUDIO_COMMAND_SENT prayer=%s track=%s", prayer, track)
-        print(f"Playing {prayer} Athan: {track}")
+        logger.info("AUDIO_COMMAND_SENT event=%s track=%s", event_name, track)
+        print(f"Playing {event_name}: {track}")
 
         while True:
             answer = input("Did you hear the Athan? Type yes or no: ").strip().lower()

@@ -11,6 +11,8 @@ There are two long-running services:
 
 The services communicate through `cache/athan-audio.sock`. Fajr uses `audio/Adhan Alfajr.mp3`; the other prayers use `audio/Adhan.mp3`. The default output can be a Bluetooth, USB, wired, or other PipeWire-managed sound device.
 
+An optional first-Fajr reminder is configured independently in `config/Fajr_first_athan.json`. When enabled, `athan.service` plays `audio/Adhan.mp3` the configured number of minutes before the official Fajr Athan. The setting is reloaded automatically when the file changes.
+
 ## Project layout
 
 ```text
@@ -21,12 +23,14 @@ piAthan/
 │   ├── Adhan Alfajr.mp3
 │   └── Adhan.mp3
 ├── config/
-│   └── mosque_url.txt          # optional; created by set_mosque_url.py
+│   ├── mosque_url.txt          # optional; created by set_mosque_url.py
+│   └── Fajr_first_athan.json   # optional; created by set_Fajr_first_athan.py
 ├── src/
 │   ├── athan.py                # scheduler and prayer triggers
 │   ├── athan_audio.py          # continuous PCM audio service
 │   ├── calendar_manager.py     # Mawaqit parser and cache management
-│   └── set_mosque_url.py       # command-line mosque URL editor
+│   ├── set_mosque_url.py       # command-line mosque URL editor
+│   └── set_Fajr_first_athan.py # first-Fajr reminder configuration
 ├── athan.services/
 │   ├── athan.service
 │   └── athan-audio.service
@@ -91,6 +95,23 @@ https://mawaqit.net/en/haus-des-friedens-dr-lslm-wuppertal-42103-germany
 
 It must use `https://mawaqit.net/en/` followed by the mosque’s page slug. The command saves the URL in `config/mosque_url.txt`; restart `athan.service` after changing it. The scheduler reads this file at fetch time, so no Python source edit is needed.
 
+### Configure the optional first-Fajr reminder
+
+Run the helper without arguments to answer both prompts:
+
+```bash
+python3 src/set_Fajr_first_athan.py
+```
+
+Or pass the two values directly:
+
+```bash
+python3 src/set_Fajr_first_athan.py on 30
+python3 src/set_Fajr_first_athan.py off 0
+```
+
+The first value enables or disables the reminder. The second value is the number of minutes before official Fajr. The helper writes `config/Fajr_first_athan.json`; `athan.py` notices the change automatically, so a service restart is not required.
+
 ### Configure the output and permanent sound tunnel
 
 Log in as `qais` locally or through a session that starts PipeWire, then inspect available outputs:
@@ -151,6 +172,12 @@ python3 test/test_athan.py Fajr
 ```
 
 Choose `Dhuhr`, `Asr`, `Maghrib`, or `Isha` to test the other audio file. The test asks whether the Athan was heard and writes a timestamped report under `test/Logs/`.
+
+Use `first-fajr` to test the reminder audio path, which intentionally uses the regular `Adhan.mp3` track:
+
+```bash
+python3 test/test_athan.py first-fajr
+```
 
 Useful checks:
 
