@@ -14,6 +14,7 @@ and the project is installed as one folder in the Pi user's home directory.
 7. The current implementation now refreshes on service startup, rolls the cache at midnight, verifies the current day at 00:01, and retries network operations five times at ten-minute intervals.
 8. A non-leap-year compatibility issue was found: Mawaqit includes a February 29 template entry in 2026. The parser now skips only that invalid optional date during non-leap years.
 9. An optional first-Fajr reminder was added. Its independent setting is stored in `config/Fajr_first_athan.json`, and it uses the existing continuous audio path with `Adhan.mp3`.
+10. PipeWire sink monitoring was added after a failure showed that the persistent stream remained routed to built-in headphones when the Echo was unavailable at service startup. The service now moves the same stream to the configured Echo sink when it appears.
 
 ## Next enhancement: screen/status integration
 

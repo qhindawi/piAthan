@@ -19,6 +19,7 @@ An optional first-Fajr reminder is configured independently in `config/Fajr_firs
 piAthan/
 ├── README.md
 ├── ENHANCEMENT_PLAN.md
+├── deploy_project.py         # compile/install/restart/report utility
 ├── audio/
 │   ├── Adhan Alfajr.mp3
 │   └── Adhan.mp3
@@ -129,7 +130,11 @@ wpctl set-default OUTPUT_ID
 
 The `athan-audio.service` unit starts `pw-cat` once and keeps it alive. It continuously sends silence and therefore provides the permanent sound tunnel. At prayer time, `athan.py` sends the MP3 path over the local Unix socket; `athan_audio.py` decodes it with FFmpeg and writes PCM into the already-open stream. If the stream exits, systemd restarts the service.
 
+The audio service monitors PipeWire every two seconds. It prefers the sink named by `ATHAN_AUDIO_SINK_NAME` and moves the existing `pw-cat` stream to that sink when it appears or changes. The current unit sets this to `Echo Dot-2CW`. If the preferred Bluetooth sink is temporarily unavailable, the service logs that state and moves the stream when the sink returns. A new stream is not created for each prayer.
+
 For a Bluetooth output, pair and connect it using the normal PipeWire/Bluetooth tools before enabling the services. For a wired or USB output, make it the default PipeWire sink. The application uses whichever output PipeWire reports as the default.
+
+For a future wired speaker, remove or change `Environment=ATHAN_AUDIO_SINK_NAME=Echo Dot-2CW` in `athan.services/athan-audio.service` to the wired sink name, then reload the unit.
 
 ### Install and enable the systemd services
 
@@ -163,6 +168,23 @@ sudo journalctl -u athan.service -n 30 --no-pager
 The scheduler creates `cache/` and `logs/` automatically. It first attempts a fresh yearly fetch. If the network is temporarily unavailable, it uses a valid current-day cache when one exists and retries in the background. At midnight it removes past dates from the rolling calendar; at 00:01 it checks today’s times again.
 
 ## Testing
+
+### Deploy and diagnose the complete project
+
+Run this on the Pi from the project directory:
+
+```bash
+cd /home/qais/piAthan
+python3 deploy_project.py
+```
+
+The utility compiles every Python file, installs every unit in `athan.services/`, reloads systemd, restarts the services with the audio service first, checks service activity, prints the last 40 audio-service journal lines, and prints `wpctl status`. The complete result is also saved under `logs/deploy_report_*.log`.
+
+To compile without changing services:
+
+```bash
+python3 deploy_project.py --compile-only
+```
 
 The test performs a real Mawaqit fetch, exercises cache rollover and verification, tests deterministic retry success and failure paths, and then sends a real playback command to `athan-audio.service`:
 

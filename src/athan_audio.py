@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import socket
 import subprocess
 import threading
@@ -18,6 +20,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 LOG_DIR = BASE_DIR / "logs"
 PW_CAT = "/usr/bin/pw-cat"
 FFMPEG = "/usr/bin/ffmpeg"
+WPCTL = "/usr/bin/wpctl"
+PREFERRED_SINK_NAME = os.environ.get("ATHAN_AUDIO_SINK_NAME", "Echo Dot-2CW")
+SINK_SCAN_INTERVAL = 2
 SAMPLE_RATE = 48_000
 CHANNELS = 2
 BYTES_PER_FRAME = 4
@@ -47,6 +52,9 @@ class ContinuousPcmPlayer:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self.sink_monitor: threading.Thread | None = None
+        self.last_route: tuple[int, int] | None = None
+        self.preferred_sink_available = False
 
     def start(self) -> None:
         self.process = subprocess.Popen(
@@ -75,7 +83,155 @@ class ContinuousPcmPlayer:
 
         self.worker = threading.Thread(target=self._feed_stream, daemon=True)
         self.worker.start()
+        self.sink_monitor = threading.Thread(target=self._monitor_sink, daemon=True)
+        self.sink_monitor.start()
         logging.info("Continuous PipeWire PCM stream started")
+
+    @staticmethod
+    def _pipewire_status() -> str | None:
+        try:
+            result = subprocess.run(
+                [WPCTL, "status"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except OSError as exc:
+            logging.warning("Could not inspect PipeWire routing: %s", exc)
+            return None
+        if result.returncode != 0:
+            logging.warning("wpctl status failed: %s", result.stderr.strip())
+            return None
+        return result.stdout
+
+    @staticmethod
+    def _parse_sinks(status: str) -> list[tuple[int, str, bool]]:
+        in_sinks = False
+        sinks: list[tuple[int, str, bool]] = []
+        for line in status.splitlines():
+            stripped = line.strip()
+            if stripped.endswith("Sinks:"):
+                in_sinks = True
+                continue
+            if in_sinks and stripped.endswith("Sink endpoints:"):
+                break
+            if not in_sinks:
+                continue
+            match = re.match(r"^\s*(\*)?\s*(\d+)\.\s+(.+?)\s*(?:\[vol:.*\])?\s*$", stripped)
+            if match:
+                sinks.append((int(match.group(2)), match.group(3).strip(), bool(match.group(1))))
+        return sinks
+
+    @classmethod
+    def _find_sink(cls, status: str, preferred_name: str) -> tuple[int, str] | None:
+        sinks = cls._parse_sinks(status)
+
+        preferred = preferred_name.strip().lower()
+        if preferred:
+            for sink_id, name, _ in sinks:
+                if name.lower() == preferred or preferred in name.lower():
+                    return sink_id, name
+        for sink_id, name, is_default in sinks:
+            if is_default:
+                return sink_id, name
+        return None
+
+    @classmethod
+    def _preferred_sink_is_present(cls, status: str, preferred_name: str) -> bool:
+        preferred = preferred_name.strip().lower()
+        return bool(
+            preferred
+            and any(
+                preferred == name.lower() or preferred in name.lower()
+                for _, name, _ in cls._parse_sinks(status)
+            )
+        )
+
+    @staticmethod
+    def _find_stream(status: str) -> int | None:
+        in_streams = False
+        for line in status.splitlines():
+            stripped = line.strip()
+            if stripped.endswith("Streams:"):
+                in_streams = True
+                continue
+            if in_streams and (
+                stripped.endswith("Video") or stripped.endswith("Settings")
+            ):
+                break
+            if not in_streams:
+                continue
+            match = re.match(r"^\s*(\d+)\.\s+pw-cat\b", stripped)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _move_stream(self, stream_id: int, sink_id: int, sink_name: str) -> bool:
+        try:
+            result = subprocess.run(
+                [WPCTL, "move", str(stream_id), str(sink_id)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except OSError as exc:
+            logging.warning("Could not move Athan stream to %s: %s", sink_name, exc)
+            return False
+        if result.returncode != 0:
+            logging.warning(
+                "Could not move Athan stream to %s: %s",
+                sink_name,
+                result.stderr.strip(),
+            )
+            return False
+        logging.info(
+            "Athan stream routed to sink %s (sink=%d stream=%d)",
+            sink_name,
+            sink_id,
+            stream_id,
+        )
+        return True
+
+    def _monitor_sink(self) -> None:
+        while not self.stop_event.is_set():
+            status = self._pipewire_status()
+            if status is not None:
+                preferred_present = self._preferred_sink_is_present(
+                    status, PREFERRED_SINK_NAME
+                )
+                sink = (
+                    self._find_sink(status, PREFERRED_SINK_NAME)
+                    if not PREFERRED_SINK_NAME or preferred_present
+                    else None
+                )
+                stream_id = self._find_stream(status)
+                if preferred_present != self.preferred_sink_available:
+                    self.preferred_sink_available = preferred_present
+                    if preferred_present:
+                        logging.info(
+                            "Preferred Athan sink became available: %s",
+                            PREFERRED_SINK_NAME,
+                        )
+                    else:
+                        logging.warning(
+                            "Preferred Athan sink is unavailable: %s",
+                            PREFERRED_SINK_NAME,
+                        )
+                if PREFERRED_SINK_NAME and not preferred_present:
+                    self.last_route = None
+                if sink is not None and stream_id is not None:
+                    route = (stream_id, sink[0])
+                    if route != self.last_route:
+                        if self._move_stream(stream_id, sink[0], sink[1]):
+                            self.last_route = route
+                elif stream_id is not None and PREFERRED_SINK_NAME:
+                    logging.debug(
+                        "Athan stream exists but preferred sink is not available yet: %s",
+                        PREFERRED_SINK_NAME,
+                    )
+            self.stop_event.wait(SINK_SCAN_INTERVAL)
 
     def _start_decoder(self, track: Path) -> subprocess.Popen:
         return subprocess.Popen(

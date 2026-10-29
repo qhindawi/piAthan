@@ -10,6 +10,7 @@ WorkingDirectory=/home/qais/piAthan
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=HOME=/home/qais
+Environment=ATHAN_AUDIO_SINK_NAME=Echo Dot-2CW
 ExecStart=/usr/bin/python3 /home/qais/piAthan/src/athan_audio.py
 Restart=always
 RestartSec=10
