@@ -15,6 +15,9 @@ and the project is installed as one folder in the Pi user's home directory.
 8. A non-leap-year compatibility issue was found: Mawaqit includes a February 29 template entry in 2026. The parser now skips only that invalid optional date during non-leap years.
 9. An optional first-Fajr reminder was added. Its independent setting is stored in `config/Fajr_first_athan.json`, and it uses the existing continuous audio path with `Adhan.mp3`.
 10. PipeWire sink monitoring was added after a failure showed that the persistent stream remained routed to built-in headphones when the Echo was unavailable at service startup. The service now moves the same stream to the configured Echo sink when it appears.
+11. Audio-output selection was added through `src/setting_audio_device.py`. The selected device and playback profile are saved in `config/audio_output.json`; the continuous audio service reloads this file without a service restart.
+12. Automatic Bluetooth playback-profile activation was enabled as requested. When the selected device exists without a playback sink during an Athan request, `athan_audio.py` uses `wpctl set-profile`, waits for the sink, and moves the existing continuous stream. The Bluetooth stack may announce the connection during this operation; activation is not attempted during ordinary service startup.
+13. `deploy_project.py` now bounds systemd commands to 15 seconds per attempt, retries them up to five times, and stops immediately after a failed daemon reload, enable, or restart.
 
 ## Next enhancement: screen/status integration
 
@@ -40,6 +43,7 @@ When a screen is added, implement a status publisher without coupling the screen
 - Add tests for December 31 to January 1 rollover and daylight-saving-time transitions.
 - Consider a configurable location/timezone instead of project constants.
 - Add an installation/update script once the Pi deployment layout is stable.
+- Make automatic Bluetooth playback-profile activation an explicit user opt-in setting. The current implementation enables it by default in `audio_output.json` because the user requested automatic activation for this phase.
 
 ## Known limitations
 

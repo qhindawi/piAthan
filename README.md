@@ -25,11 +25,14 @@ piAthan/
 │   └── Adhan.mp3
 ├── config/
 │   ├── mosque_url.txt          # optional; created by set_mosque_url.py
-│   └── Fajr_first_athan.json   # optional; created by set_Fajr_first_athan.py
+│   ├── Fajr_first_athan.json   # optional; created by set_Fajr_first_athan.py
+│   └── audio_output.json       # optional; created by setting_audio_device.py
 ├── src/
 │   ├── athan.py                # scheduler and prayer triggers
 │   ├── athan_audio.py          # continuous PCM audio service
 │   ├── calendar_manager.py     # Mawaqit parser and cache management
+│   ├── audio_device.py         # PipeWire device/profile discovery helpers
+│   ├── setting_audio_device.py  # interactive audio-output selector
 │   ├── set_mosque_url.py       # command-line mosque URL editor
 │   └── set_Fajr_first_athan.py # first-Fajr reminder configuration
 ├── athan.services/
@@ -47,7 +50,7 @@ On Raspberry Pi OS or another Debian-based Pi system, install Python, FFmpeg, Pi
 
 ```bash
 sudo apt update
-sudo apt install -y python3 ffmpeg pipewire pipewire-pulse wireplumber pipewire-bin libspa-0.2-bluetooth
+sudo apt install -y python3 ffmpeg pipewire pipewire-pulse wireplumber pipewire-bin libspa-0.2-bluetooth pulseaudio-utils
 ```
 
 The Pi must have internet access, a working PipeWire session for the service user, the two MP3 files in `audio/`, and a configured default PipeWire output device. No third-party Python packages are required.
@@ -122,7 +125,15 @@ export XDG_RUNTIME_DIR=/run/user/$(id -u)
 wpctl status
 ```
 
-If necessary, select the desired output by its numeric ID:
+Select and save the output interactively:
+
+```bash
+python3 src/setting_audio_device.py
+```
+
+The selector lists current sinks and playback-capable profiles. On older `wpctl` versions that do not provide `get-profile`, it uses `pactl` to inspect PipeWire-Pulse card profiles. It saves the selected device and profile in `config/audio_output.json`. The audio service reloads this file while running, so changing the JSON does not require restarting either Athan service.
+
+If necessary, select the desired output by its numeric ID for other PipeWire applications:
 
 ```bash
 wpctl set-default OUTPUT_ID
@@ -130,11 +141,11 @@ wpctl set-default OUTPUT_ID
 
 The `athan-audio.service` unit starts `pw-cat` once and keeps it alive. It continuously sends silence and therefore provides the permanent sound tunnel. At prayer time, `athan.py` sends the MP3 path over the local Unix socket; `athan_audio.py` decodes it with FFmpeg and writes PCM into the already-open stream. If the stream exits, systemd restarts the service.
 
-The audio service monitors PipeWire every two seconds. It prefers the sink named by `ATHAN_AUDIO_SINK_NAME` and moves the existing `pw-cat` stream to that sink when it appears or changes. The current unit sets this to `Echo Dot-2CW`. If the preferred Bluetooth sink is temporarily unavailable, the service logs that state and moves the stream when the sink returns. A new stream is not created for each prayer.
+The audio service monitors PipeWire every two seconds. It prefers the sink selected in `config/audio_output.json` and moves the existing `pw-cat` stream to that sink when it appears or changes. If the selected Bluetooth device exists but has no playback sink when an Athan is requested, the service activates the saved playback profile with `wpctl set-profile`, then waits for the sink and moves the same continuous stream to it. This can cause the Bluetooth speaker's connection announcement; that behavior is intentionally enabled for now. A new stream is not created for each prayer, and profile activation is not attempted during ordinary service startup.
 
 For a Bluetooth output, pair and connect it using the normal PipeWire/Bluetooth tools before enabling the services. For a wired or USB output, make it the default PipeWire sink. The application uses whichever output PipeWire reports as the default.
 
-For a future wired speaker, remove or change `Environment=ATHAN_AUDIO_SINK_NAME=Echo Dot-2CW` in `athan.services/athan-audio.service` to the wired sink name, then reload the unit.
+For a future wired speaker, run `python3 src/setting_audio_device.py` and choose the wired sink. The old `ATHAN_AUDIO_SINK_NAME` environment setting remains only as a compatibility fallback when `config/audio_output.json` does not exist.
 
 ### Install and enable the systemd services
 
@@ -178,7 +189,7 @@ cd /home/qais/piAthan
 python3 deploy_project.py
 ```
 
-The utility compiles every Python file, installs every unit in `athan.services/`, reloads systemd, restarts the services with the audio service first, checks service activity, prints the last 40 audio-service journal lines, and prints `wpctl status`. The complete result is also saved under `logs/deploy_report_*.log`.
+The utility asks whether the audio output should be changed and, if selected, runs `setting_audio_device.py`. It then asks whether to recompile, install, and restart the services. Choosing no leaves running services untouched; the audio service hot-reloads the saved output JSON. Choosing yes compiles every Python file, installs every unit in `athan.services/`, reloads systemd, restarts the services with the audio service first, checks service activity, prints the last 40 audio-service journal lines, and prints `wpctl status`. Systemd commands have a 15-second timeout and up to five attempts; deployment stops immediately if daemon reload, enable, or restart fails. The complete result is also saved under `logs/deploy_report_*.log`.
 
 To compile without changing services:
 

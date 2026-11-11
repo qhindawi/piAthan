@@ -11,9 +11,20 @@ import socket
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from athan import CONTROL_SOCKET, FAJR_TRACK, OTHER_TRACK
+from audio_device import (
+    AudioProfile,
+    find_named_device,
+    find_named_sink,
+    find_pactl_card,
+    get_profiles,
+    parse_audio_devices,
+    parse_audio_sinks,
+    playback_profiles,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -21,13 +32,69 @@ LOG_DIR = BASE_DIR / "logs"
 PW_CAT = "/usr/bin/pw-cat"
 FFMPEG = "/usr/bin/ffmpeg"
 WPCTL = "/usr/bin/wpctl"
-PREFERRED_SINK_NAME = os.environ.get("ATHAN_AUDIO_SINK_NAME", "Echo Dot-2CW")
+AUDIO_OUTPUT_CONFIG = BASE_DIR / "config" / "audio_output.json"
 SINK_SCAN_INTERVAL = 2
 SAMPLE_RATE = 48_000
 CHANNELS = 2
 BYTES_PER_FRAME = 4
 SILENCE_FRAMES = 4_800
 SILENCE = b"\x00" * (SILENCE_FRAMES * BYTES_PER_FRAME)
+
+
+@dataclass(frozen=True)
+class AudioOutputSettings:
+    device_name: str
+    sink_name: str
+    profile_name: str | None = None
+    profile_index: int | None = None
+    profile_backend: str | None = None
+    auto_activate_profile: bool = True
+
+
+def output_config_signature():
+    try:
+        stat = AUDIO_OUTPUT_CONFIG.stat()
+        return stat.st_mtime_ns, stat.st_size
+    except FileNotFoundError:
+        return None
+
+
+def load_audio_output_settings() -> AudioOutputSettings:
+    """Load JSON output settings, retaining the legacy environment fallback."""
+    try:
+        payload = json.loads(AUDIO_OUTPUT_CONFIG.read_text(encoding="utf-8"))
+        device_name = str(payload["device_name"]).strip()
+        sink_name = str(payload.get("sink_name", device_name)).strip()
+        profile_name = payload.get("profile_name")
+        if profile_name is not None:
+            profile_name = str(profile_name).strip() or None
+        profile_index = payload.get("profile_index")
+        if profile_index is not None:
+            if isinstance(profile_index, bool) or not isinstance(profile_index, int):
+                raise ValueError("profile_index must be an integer or null")
+        profile_backend = payload.get("profile_backend")
+        if profile_backend is not None:
+            profile_backend = str(profile_backend).strip() or None
+        auto_activate = payload.get("auto_activate_profile", True)
+        if not isinstance(auto_activate, bool):
+            raise ValueError("auto_activate_profile must be true or false")
+        if not device_name or not sink_name:
+            raise ValueError("device_name and sink_name must not be empty")
+        return AudioOutputSettings(
+            device_name,
+            sink_name,
+            profile_name,
+            profile_index,
+            profile_backend,
+            auto_activate,
+        )
+    except FileNotFoundError:
+        sink_name = os.environ.get("ATHAN_AUDIO_SINK_NAME", "Echo Dot-2CW").strip()
+        return AudioOutputSettings(sink_name, sink_name, auto_activate_profile=True)
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        logging.error("Invalid %s; using environment fallback: %s", AUDIO_OUTPUT_CONFIG, exc)
+        sink_name = os.environ.get("ATHAN_AUDIO_SINK_NAME", "Echo Dot-2CW").strip()
+        return AudioOutputSettings(sink_name, sink_name, auto_activate_profile=True)
 
 
 def configure_logging() -> None:
@@ -55,6 +122,11 @@ class ContinuousPcmPlayer:
         self.sink_monitor: threading.Thread | None = None
         self.last_route: tuple[int, int] | None = None
         self.preferred_sink_available = False
+        self.output_settings = load_audio_output_settings()
+        self.output_config_signature = output_config_signature()
+        self.profile_attempt: tuple[int, int] | None = None
+        self.profile_attempt_at = 0.0
+        self.activation_requested = False
 
     def start(self) -> None:
         self.process = subprocess.Popen(
@@ -104,6 +176,145 @@ class ContinuousPcmPlayer:
             logging.warning("wpctl status failed: %s", result.stderr.strip())
             return None
         return result.stdout
+
+    def _reload_output_settings(self) -> AudioOutputSettings:
+        signature = output_config_signature()
+        if signature != self.output_config_signature:
+            self.output_settings = load_audio_output_settings()
+            self.output_config_signature = signature
+            self.last_route = None
+            self.profile_attempt = None
+            logging.info(
+                "Reloaded audio output: device=%s sink=%s profile=%s auto_activate=%s",
+                self.output_settings.device_name,
+                self.output_settings.sink_name,
+                self.output_settings.profile_name or "automatic",
+                self.output_settings.auto_activate_profile,
+            )
+        return self.output_settings
+
+    def _activate_profile(
+        self, device_id: int, settings: AudioOutputSettings
+    ) -> bool:
+        if not settings.auto_activate_profile:
+            return False
+        try:
+            profiles = playback_profiles(get_profiles(device_id, settings.device_name))
+        except (OSError, RuntimeError) as exc:
+            logging.warning(
+                "Could not inspect playback profiles for %s: %s",
+                settings.device_name,
+                exc,
+            )
+            return False
+
+        selected: AudioProfile | None = None
+        if settings.profile_name:
+            wanted = settings.profile_name.lower()
+            selected = next(
+                (
+                    profile
+                    for profile in profiles
+                    if profile.name.lower() == wanted
+                    or wanted in profile.name.lower()
+                ),
+                None,
+            )
+        if selected is None and settings.profile_index is not None:
+            selected = next(
+                (profile for profile in profiles if profile.index == settings.profile_index),
+                None,
+            )
+        if selected is None and profiles:
+            selected = next(
+                (profile for profile in profiles if "a2dp" in profile.name.lower()),
+                profiles[0],
+            )
+        if selected is None:
+            logging.warning(
+                "No playback profile is available for selected device: %s",
+                settings.device_name,
+            )
+            return False
+
+        attempt = (device_id, selected.index or -1)
+        if attempt == self.profile_attempt and time.monotonic() - self.profile_attempt_at < 30:
+            return False
+        self.profile_attempt = attempt
+        self.profile_attempt_at = time.monotonic()
+        if selected.backend == "pactl":
+            try:
+                card_name = find_pactl_card(settings.device_name)
+            except (OSError, RuntimeError) as exc:
+                logging.warning(
+                    "Could not locate the PipeWire-Pulse card for %s: %s",
+                    settings.device_name,
+                    exc,
+                )
+                return False
+            if not card_name:
+                logging.warning(
+                    "Could not locate the PipeWire-Pulse card for %s",
+                    settings.device_name,
+                )
+                return False
+            command = ["/usr/bin/pactl", "set-card-profile", card_name, selected.name]
+        else:
+            if selected.index is None:
+                logging.warning("wpctl profile has no numeric index: %s", selected.name)
+                return False
+            command = [WPCTL, "set-profile", str(device_id), str(selected.index)]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except OSError as exc:
+            logging.warning(
+                "Could not activate Bluetooth playback profile %s for %s: %s",
+                selected.name,
+                settings.device_name,
+                exc,
+            )
+            return False
+        if result.returncode != 0:
+            logging.warning(
+                "Could not activate Bluetooth playback profile %s for %s: %s",
+                selected.name,
+                settings.device_name,
+                result.stderr.strip(),
+            )
+            return False
+        logging.warning(
+            "Activated Bluetooth playback profile %s for %s using %s; the speaker may announce the connection",
+            selected.name,
+            settings.device_name,
+            selected.backend,
+        )
+        return True
+
+    @staticmethod
+    def _set_default_sink(sink_id: int, sink_name: str) -> None:
+        try:
+            result = subprocess.run(
+                [WPCTL, "set-default", str(sink_id)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except OSError as exc:
+            logging.warning("Could not set default Athan sink %s: %s", sink_name, exc)
+            return
+        if result.returncode != 0:
+            logging.warning(
+                "Could not set default Athan sink %s: %s",
+                sink_name,
+                result.stderr.strip(),
+            )
 
     @staticmethod
     def _parse_sinks(status: str) -> list[tuple[int, str, bool]]:
@@ -198,38 +409,41 @@ class ContinuousPcmPlayer:
         while not self.stop_event.is_set():
             status = self._pipewire_status()
             if status is not None:
-                preferred_present = self._preferred_sink_is_present(
-                    status, PREFERRED_SINK_NAME
-                )
-                sink = (
-                    self._find_sink(status, PREFERRED_SINK_NAME)
-                    if not PREFERRED_SINK_NAME or preferred_present
-                    else None
-                )
+                settings = self._reload_output_settings()
+                devices = parse_audio_devices(status)
+                sinks = parse_audio_sinks(status)
+                sink = find_named_sink(sinks, settings.sink_name)
+                if sink is None and self.activation_requested:
+                    device = find_named_device(devices, settings.device_name)
+                    if device is not None:
+                        self._activate_profile(device.object_id, settings)
                 stream_id = self._find_stream(status)
+                preferred_present = sink is not None
                 if preferred_present != self.preferred_sink_available:
                     self.preferred_sink_available = preferred_present
                     if preferred_present:
                         logging.info(
                             "Preferred Athan sink became available: %s",
-                            PREFERRED_SINK_NAME,
+                            settings.sink_name,
                         )
                     else:
                         logging.warning(
                             "Preferred Athan sink is unavailable: %s",
-                            PREFERRED_SINK_NAME,
+                            settings.sink_name,
                         )
-                if PREFERRED_SINK_NAME and not preferred_present:
+                if not preferred_present:
                     self.last_route = None
                 if sink is not None and stream_id is not None:
-                    route = (stream_id, sink[0])
+                    self.activation_requested = False
+                    route = (stream_id, sink.object_id)
                     if route != self.last_route:
-                        if self._move_stream(stream_id, sink[0], sink[1]):
+                        self._set_default_sink(sink.object_id, sink.name)
+                        if self._move_stream(stream_id, sink.object_id, sink.name):
                             self.last_route = route
-                elif stream_id is not None and PREFERRED_SINK_NAME:
+                elif stream_id is not None:
                     logging.debug(
                         "Athan stream exists but preferred sink is not available yet: %s",
-                        PREFERRED_SINK_NAME,
+                        settings.sink_name,
                     )
             self.stop_event.wait(SINK_SCAN_INTERVAL)
 
@@ -292,11 +506,13 @@ class ContinuousPcmPlayer:
         with self.lock:
             self._close_decoder()
             self.track = track
+            self.activation_requested = True
 
     def silence(self) -> None:
         with self.lock:
             self._close_decoder()
             self.track = None
+            self.activation_requested = False
 
     def stop(self) -> None:
         self.stop_event.set()

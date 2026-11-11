@@ -28,6 +28,12 @@ from calendar_manager import (  # noqa: E402
     fetch_year_calendar,
     get_mosque_url,
 )
+from audio_device import (  # noqa: E402
+    find_named_sink,
+    parse_audio_devices,
+    parse_audio_sinks,
+    run_wpctl,
+)
 from set_Fajr_first_athan import (  # noqa: E402
     parse_enabled,
     parse_minutes,
@@ -83,6 +89,31 @@ def audio_diagnostic() -> str:
     except Exception as exc:
         lines.append(f"wpctl status failed: {exc}")
     return "\n".join(lines)
+
+
+def log_audio_output_discovery(logger: logging.Logger) -> None:
+    """Record devices, sinks, and the configured target before playback."""
+    try:
+        status = run_wpctl(["status"])
+        devices = parse_audio_devices(status)
+        sinks = parse_audio_sinks(status)
+        configured = None
+        config_path = PROJECT_DIR / "config" / "audio_output.json"
+        if config_path.is_file():
+            configured = json.loads(config_path.read_text(encoding="utf-8"))
+        configured_sink = find_named_sink(
+            sinks,
+            configured.get("sink_name") if isinstance(configured, dict) else None,
+        )
+        logger.info(
+            "AUDIO_OUTPUT_DISCOVERY devices=%s sinks=%s configured=%s configured_sink=%s",
+            [device.name for device in devices],
+            [sink.name for sink in sinks],
+            configured,
+            configured_sink.name if configured_sink else None,
+        )
+    except Exception as exc:
+        logger.warning("AUDIO_OUTPUT_DISCOVERY_FAILED error=%s", exc)
 
 
 def configure_test_fajr_first_athan(logger, today_times) -> athan.FajrFirstAthanSettings:
@@ -208,6 +239,7 @@ def main() -> int:
         if failed is not None:
             raise RuntimeError("permanent-failure retry test unexpectedly succeeded")
         logger.info("RETRY_TESTS_COMPLETED")
+        log_audio_output_discovery(logger)
     except Exception:
         logger.exception("CALENDAR_TEST_FAILED")
         print("Calendar test failed; see the report for details.")
