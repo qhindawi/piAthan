@@ -21,9 +21,12 @@ from audio_device import (
     find_named_sink,
     find_pactl_card,
     get_profiles,
+    get_sink_volume,
     parse_audio_devices,
     parse_audio_sinks,
     playback_profiles,
+    set_sink_mute,
+    set_sink_volume,
 )
 
 
@@ -316,6 +319,44 @@ class ContinuousPcmPlayer:
                 result.stderr.strip(),
             )
 
+    def _configured_sink(self):
+        settings = self._reload_output_settings()
+        status = self._pipewire_status()
+        if status is None:
+            raise RuntimeError("Could not read PipeWire status")
+        sink = find_named_sink(parse_audio_sinks(status), settings.sink_name)
+        if sink is None:
+            raise RuntimeError(
+                f"Configured HDMI audio sink is unavailable: {settings.sink_name}"
+            )
+        return sink
+
+    def volume_status(self) -> dict:
+        sink = self._configured_sink()
+        volume = get_sink_volume(sink.object_id)
+        return {
+            "sink_id": sink.object_id,
+            "sink_name": sink.name,
+            "volume": volume.value,
+            "volume_percent": round(volume.value * 100, 1),
+            "muted": volume.muted,
+        }
+
+    def set_volume(self, value: float) -> dict:
+        sink = self._configured_sink()
+        set_sink_volume(sink.object_id, value)
+        return self.volume_status()
+
+    def step_volume(self, delta: float) -> dict:
+        current = self.volume_status()
+        value = max(0.0, min(1.0, current["volume"] + delta))
+        return self.set_volume(value)
+
+    def set_mute(self, muted: bool | None) -> dict:
+        sink = self._configured_sink()
+        set_sink_mute(sink.object_id, muted)
+        return self.volume_status()
+
     @staticmethod
     def _parse_sinks(status: str) -> list[tuple[int, str, bool]]:
         in_sinks = False
@@ -547,7 +588,45 @@ def serve() -> None:
                     action = request.get("action")
 
                     if action == "status":
-                        send_response(connection, {"ok": True, "status": "ready"})
+                        try:
+                            output = player.volume_status()
+                        except (OSError, RuntimeError) as exc:
+                            output = {"available": False, "error": str(exc)}
+                        else:
+                            output["available"] = True
+                        send_response(
+                            connection,
+                            {"ok": True, "status": "ready", "audio_output": output},
+                        )
+                    elif action == "volume_status":
+                        send_response(
+                            connection,
+                            {"ok": True, "status": "volume", "audio_output": player.volume_status()},
+                        )
+                    elif action == "volume_set":
+                        value = request.get("value")
+                        if isinstance(value, bool) or not isinstance(value, (int, float)):
+                            raise ValueError("volume value must be a number between 0 and 1")
+                        send_response(
+                            connection,
+                            {"ok": True, "status": "volume", "audio_output": player.set_volume(float(value))},
+                        )
+                    elif action == "volume_step":
+                        delta = request.get("delta")
+                        if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+                            raise ValueError("volume delta must be a number")
+                        send_response(
+                            connection,
+                            {"ok": True, "status": "volume", "audio_output": player.step_volume(float(delta))},
+                        )
+                    elif action == "volume_mute":
+                        muted = request.get("muted")
+                        if muted is not None and not isinstance(muted, bool):
+                            raise ValueError("muted must be true, false, or omitted for toggle")
+                        send_response(
+                            connection,
+                            {"ok": True, "status": "volume", "audio_output": player.set_mute(muted)},
+                        )
                     elif action == "play":
                         track = Path(request.get("track", "")).resolve()
                         allowed_tracks = {FAJR_TRACK.resolve(), OTHER_TRACK.resolve()}

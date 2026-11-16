@@ -273,6 +273,10 @@ def main() -> int:
         if not audio.wait_until_ready():
             raise RuntimeError("athan-audio.service is not ready")
         logger.info("AUDIO_SERVICE_READY socket=%s", athan.CONTROL_SOCKET)
+        try:
+            logger.info("AUDIO_VOLUME_STATUS volume=%s", audio.volume_status())
+        except (OSError, RuntimeError) as exc:
+            logger.warning("AUDIO_VOLUME_STATUS_FAILED error=%s", exc)
         audio.play(track)
         logger.info("AUDIO_COMMAND_SENT event=%s track=%s", event_name, track)
         print(f"Playing {event_name}: {track}")

@@ -34,6 +34,12 @@ class AudioProfile:
     backend: str
 
 
+@dataclass(frozen=True)
+class AudioVolume:
+    value: float
+    muted: bool
+
+
 def run_wpctl(arguments: list[str], timeout: float = 5) -> str:
     result = subprocess.run(
         [WPCTL, *arguments],
@@ -60,6 +66,27 @@ def run_pactl(arguments: list[str], timeout: float = 5) -> str:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"pactl {' '.join(arguments)} failed: {detail}")
     return result.stdout
+
+
+def get_sink_volume(sink_id: int) -> AudioVolume:
+    output = run_wpctl(["get-volume", str(sink_id)])
+    match = re.search(r"Volume:\s*([0-9]+(?:\.[0-9]+)?)", output)
+    if not match:
+        raise RuntimeError(f"Could not parse volume for sink {sink_id}: {output.strip()}")
+    muted = bool(re.search(r"Mute:\s*true", output, re.IGNORECASE))
+    if "[MUTED]" in output.upper():
+        muted = True
+    return AudioVolume(float(match.group(1)), muted)
+
+
+def set_sink_volume(sink_id: int, value: float) -> None:
+    value = max(0.0, min(1.0, value))
+    run_wpctl(["set-volume", str(sink_id), f"{value:.3f}"])
+
+
+def set_sink_mute(sink_id: int, muted: bool | None) -> None:
+    value = "toggle" if muted is None else ("1" if muted else "0")
+    run_wpctl(["set-mute", str(sink_id), value])
 
 
 def _object_line(line: str) -> tuple[int, bool, str] | None:

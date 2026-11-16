@@ -18,6 +18,7 @@ An optional first-Fajr reminder is configured independently in `config/Fajr_firs
 ```text
 piAthan/
 ├── README.md
+├── dashboard.md
 ├── ENHANCEMENT_PLAN.md
 ├── deploy_project.py         # compile/install/restart/report utility
 ├── audio/
@@ -33,6 +34,7 @@ piAthan/
 │   ├── calendar_manager.py     # Mawaqit parser and cache management
 │   ├── audio_device.py         # PipeWire device/profile discovery helpers
 │   ├── setting_audio_device.py  # interactive audio-output selector
+│   ├── set_volume.py            # HDMI output volume and mute control
 │   ├── set_mosque_url.py       # command-line mosque URL editor
 │   └── set_Fajr_first_athan.py # first-Fajr reminder configuration
 ├── athan.services/
@@ -146,6 +148,28 @@ The audio service monitors PipeWire every two seconds. It prefers the sink selec
 For a Bluetooth output, pair and connect it using the normal PipeWire/Bluetooth tools before enabling the services. For a wired or USB output, make it the default PipeWire sink. The application uses whichever output PipeWire reports as the default.
 
 For a future wired speaker, run `python3 src/setting_audio_device.py` and choose the wired sink. The old `ATHAN_AUDIO_SINK_NAME` environment setting remains only as a compatibility fallback when `config/audio_output.json` does not exist.
+
+### Control the HDMI output volume
+
+The volume helper communicates with the existing `athan-audio.service`; it does not start another audio process or reconnect Bluetooth. The configured output should be the screen's HDMI sink selected with `setting_audio_device.py`.
+
+```bash
+python3 src/set_volume.py status
+python3 src/set_volume.py set 50
+python3 src/set_volume.py up 5
+python3 src/set_volume.py down 5
+python3 src/set_volume.py mute
+python3 src/set_volume.py unmute
+python3 src/set_volume.py toggle
+```
+
+The command prints the current sink, volume percentage, and mute state after each successful operation. For dashboard integration, request machine-readable output with:
+
+```bash
+python3 src/set_volume.py status --json
+```
+
+The same operations are available through the existing `cache/athan-audio.sock` protocol as `volume_status`, `volume_set`, `volume_step`, and `volume_mute`.
 
 ### Install and enable the systemd services
 

@@ -132,6 +132,27 @@ class AudioController:
     def stop(self) -> None:
         self._send({"action": "stop"})
 
+    def volume_status(self) -> dict:
+        return self._send({"action": "volume_status"})["audio_output"]
+
+    def set_volume(self, percent: float) -> dict:
+        if not 0 <= percent <= 100:
+            raise ValueError("volume percentage must be between 0 and 100")
+        return self._send(
+            {"action": "volume_set", "value": percent / 100}
+        )["audio_output"]
+
+    def step_volume(self, delta_percent: float) -> dict:
+        return self._send(
+            {"action": "volume_step", "delta": delta_percent / 100}
+        )["audio_output"]
+
+    def set_mute(self, muted: bool | None = None) -> dict:
+        request = {"action": "volume_mute"}
+        if muted is not None:
+            request["muted"] = muted
+        return self._send(request)["audio_output"]
+
 
 class ScheduleState:
     def __init__(self, schedule: dict[str, str] | None = None):
