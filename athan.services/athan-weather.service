@@ -1,0 +1,16 @@
+[Unit]
+Description=piAthan cached weather updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qais
+WorkingDirectory=/home/qais/piAthan
+Environment=HOME=/home/qais
+ExecStart=/usr/bin/python3 /home/qais/piAthan/src/weather_service.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

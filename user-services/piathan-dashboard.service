@@ -1,0 +1,16 @@
+[Unit]
+Description=piAthan touchscreen dashboard (user session)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=QT_QPA_PLATFORM=wayland
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=%t
+ExecStartPre=/usr/bin/test -S %t/wayland-0
+ExecStart=/usr/bin/python3 %h/piAthan/src/dashboard_client.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

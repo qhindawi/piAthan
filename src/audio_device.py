@@ -89,6 +89,36 @@ def set_sink_mute(sink_id: int, muted: bool | None) -> None:
     run_wpctl(["set-mute", str(sink_id), value])
 
 
+def parse_pactl_objects(text: str, kind: str) -> list[dict]:
+    """Parse pactl sink or sink-input indexes and their PipeWire object IDs."""
+    if kind not in {"Sink", "Sink Input"}:
+        raise ValueError("Unsupported pactl object kind")
+    objects = []
+    current = None
+    for line in text.splitlines():
+        header = re.fullmatch(rf"{re.escape(kind)} #(\d+)\s*", line.strip())
+        if header:
+            current = {"index": int(header.group(1)), "object_id": None, "sink": None}
+            objects.append(current)
+            continue
+        if current is None:
+            continue
+        match = re.fullmatch(r'\s*object\.id\s*=\s*"(\d+)"\s*', line)
+        if match:
+            current["object_id"] = int(match.group(1))
+        sink = re.fullmatch(r"\s*Sink:\s*(\d+)\s*", line)
+        if sink:
+            current["sink"] = int(sink.group(1))
+    return objects
+
+
+def resolve_pactl_index(objects: list[dict], object_id: int) -> dict:
+    matches = [item for item in objects if item.get("object_id") == object_id]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one PulseAudio object for PipeWire id {object_id}; found {len(matches)}")
+    return matches[0]
+
+
 def _object_line(line: str) -> tuple[int, bool, str] | None:
     match = re.search(r"(?P<star>\*)?\s*(?P<id>\d+)\.\s+(?P<body>.+)$", line.strip())
     if not match:

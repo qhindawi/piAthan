@@ -269,6 +269,7 @@ def main() -> int:
         event_name = f"{prayer} Athan"
         track = athan.FAJR_TRACK if prayer == "Fajr" else athan.OTHER_TRACK
     audio = athan.AudioController()
+    playback_stopped = False
     try:
         if not audio.wait_until_ready():
             raise RuntimeError("athan-audio.service is not ready")
@@ -286,6 +287,7 @@ def main() -> int:
             logger.info("USER_FEEDBACK response=%r", answer)
             if answer in {"yes", "y"}:
                 audio.stop()
+                playback_stopped = True
                 logger.info("PLAYBACK_STOPPED result=success")
                 print("Athan played successfully.")
                 return 0
@@ -295,6 +297,7 @@ def main() -> int:
                 print("Athan was not heard. Diagnostic report:")
                 print(diagnostic)
                 audio.stop()
+                playback_stopped = True
                 logger.info("PLAYBACK_STOPPED result=diagnostic-complete")
                 return 1
             logger.warning("INVALID_FEEDBACK response=%r", answer)
@@ -304,10 +307,11 @@ def main() -> int:
         print("Audio test failed; see the report for details.")
         return 1
     finally:
-        try:
-            audio.stop()
-        except (OSError, RuntimeError):
-            pass
+        if not playback_stopped:
+            try:
+                audio.stop()
+            except (OSError, RuntimeError):
+                pass
         logger.info("TEST_END")
 
 

@@ -158,14 +158,18 @@ class ScheduleState:
     def __init__(self, schedule: dict[str, str] | None = None):
         self.lock = threading.Lock()
         self.schedule = schedule
+        self.schedule_date = datetime.now(TIMEZONE).date() if schedule else None
 
-    def get(self) -> dict[str, str] | None:
+    def get(self, date_value=None) -> dict[str, str] | None:
         with self.lock:
+            if date_value is not None and self.schedule_date != date_value:
+                return None
             return dict(self.schedule) if self.schedule else None
 
-    def set(self, schedule: dict[str, str]) -> None:
+    def set(self, schedule: dict[str, str], date_value=None) -> None:
         with self.lock:
             self.schedule = dict(schedule)
+            self.schedule_date = date_value or datetime.now(TIMEZONE).date()
 
 
 def prayer_datetimes(schedule: dict[str, str], date_value) -> list[tuple[str, datetime]]:
@@ -210,14 +214,41 @@ def play_athan(audio: AudioController, event_name: str, track: Path | None = Non
 
 
 def refresh_in_background(manager: YearCalendarManager, state: ScheduleState) -> None:
+    request_date = datetime.now(TIMEZONE).date()
+    def publish(status, **details):
+        if datetime.now(TIMEZONE).date() == request_date:
+            manager.schedule_status(status, using_cache=bool(state.get(request_date)), **details)
     result = retry(
         manager.refresh_from_web,
         "startup year-calendar fetch",
         attempts=5,
         interval=600,
+        on_status=publish,
     )
     if result:
-        state.set(result)
+        current = manager.load_today()
+        if current:
+            state.set(current)
+
+
+def update_schedule_in_background(manager, state, date_value, operation, label):
+    """Retry network work off the scheduler thread and reject stale results."""
+    def publish(status, **details):
+        if datetime.now(TIMEZONE).date() == date_value:
+            manager.schedule_status(status, using_cache=bool(state.get(date_value)), **details)
+    result = retry(operation, label, attempts=5, interval=600, on_status=publish)
+    if result and datetime.now(TIMEZONE).date() == date_value:
+        current = manager.load_today()
+        if current:
+            state.set(current, date_value)
+            manager.schedule_status("ready", using_cache=(label == "midnight calendar rollover"),
+                                    last_error=None)
+            return
+    if datetime.now(TIMEZONE).date() == date_value:
+        cached = state.get(date_value)
+        manager.schedule_status("using_cached_times" if cached else "failed",
+                                using_cache=bool(cached),
+                                last_error=f"{label} failed after all retries")
 
 
 def main() -> None:
@@ -233,6 +264,7 @@ def main() -> None:
         logging.exception("Initial year-calendar fetch failed")
         schedule = manager.load_today()
         if schedule:
+            manager.schedule_status("using_cached_times", using_cache=True)
             state.set(schedule)
             threading.Thread(
                 target=refresh_in_background,
@@ -290,17 +322,38 @@ def main() -> None:
 
     while True:
         now = datetime.now(TIMEZONE)
-        updated_schedule = state.get()
+
+        if now.date() != scheduled_date:
+            scheduled_date = now.date()
+            schedule = None
+            fired.clear()
+            fajr_settings = load_fajr_first_athan_settings()
+            fajr_config_signature = config_signature()
+            logging.info("Midnight rollover started for %s", scheduled_date)
+            manager.schedule_status("updating", using_cache=False)
+            threading.Thread(
+                target=update_schedule_in_background,
+                args=(manager, state, scheduled_date, manager.rollover_at_midnight,
+                      "midnight calendar rollover"), daemon=True,
+            ).start()
+            verified_date = None
+
+        updated_schedule = state.get(scheduled_date)
         if updated_schedule:
+            if schedule is None:
+                fired.update(
+                    event_name for event_name, event_at in scheduled_events(
+                        updated_schedule, scheduled_date, fajr_settings
+                    ) if event_at <= now
+                )
             schedule = updated_schedule
 
         current_config_signature = config_signature()
         if current_config_signature != fajr_config_signature:
             fajr_settings = load_fajr_first_athan_settings()
             fajr_config_signature = current_config_signature
-            reminder_at = fajr_first_athan_datetime(
-                schedule, scheduled_date, fajr_settings
-            )
+            reminder_at = (fajr_first_athan_datetime(schedule, scheduled_date, fajr_settings)
+                           if schedule else None)
             if reminder_at is None or reminder_at <= now:
                 fired.add(FAJR_FIRST_ATHAN_EVENT)
             else:
@@ -311,50 +364,18 @@ def main() -> None:
                 fajr_settings.minutes_before_fajr,
             )
 
-        if now.date() != scheduled_date:
-            scheduled_date = now.date()
-            fired.clear()
-            fajr_settings = load_fajr_first_athan_settings()
-            fajr_config_signature = config_signature()
-            logging.info("Midnight rollover started for %s", scheduled_date)
-            rolled = retry(
-                manager.rollover_at_midnight,
-                "midnight calendar rollover",
-                attempts=5,
-                interval=600,
-            )
-            if rolled:
-                schedule = rolled
-                state.set(schedule)
-            else:
-                logging.error("Midnight rollover failed; keeping the previous in-memory schedule")
-            fired.update(
-                event_name
-                for event_name, event_at in scheduled_events(
-                    schedule, scheduled_date, fajr_settings
-                )
-                if event_at <= now
-            )
-            verified_date = None
-
         if verified_date != scheduled_date and now.time() >= VERIFY_TIME:
-            checked = retry(
-                manager.verify_today_and_repair,
-                "00:01 daily prayer-time verification",
-                attempts=5,
-                interval=600,
-            )
-            if checked:
-                schedule = checked
-                state.set(schedule)
-                reminder_at = fajr_first_athan_datetime(
-                    schedule, scheduled_date, fajr_settings
-                )
-                if reminder_at is not None and reminder_at <= now:
-                    fired.add(FAJR_FIRST_ATHAN_EVENT)
-            else:
-                logging.error("Daily verification failed after all retries; keeping today's saved times")
+            threading.Thread(
+                target=update_schedule_in_background,
+                args=(manager, state, scheduled_date, manager.verify_today_and_repair,
+                      "00:01 daily prayer-time verification"), daemon=True,
+            ).start()
             verified_date = scheduled_date
+
+        if schedule is None:
+            # Never schedule yesterday's times against the new date.
+            time.sleep(1)
+            continue
 
         for event_name, event_at in scheduled_events(
             schedule, scheduled_date, fajr_settings

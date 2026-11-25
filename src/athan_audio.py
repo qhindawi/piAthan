@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -12,6 +13,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from athan import CONTROL_SOCKET, FAJR_TRACK, OTHER_TRACK
@@ -22,12 +24,20 @@ from audio_device import (
     find_pactl_card,
     get_profiles,
     get_sink_volume,
+    parse_pactl_objects,
     parse_audio_devices,
     parse_audio_sinks,
     playback_profiles,
+    resolve_pactl_index,
+    run_pactl,
     set_sink_mute,
     set_sink_volume,
 )
+from volume_profiles import VolumeProfiles
+from quran_controller import QuranController
+from quran_artwork import extract_artwork
+from quran_library import discover_library, save_library
+from quran_timer import QuranTimer
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -119,7 +129,7 @@ class ContinuousPcmPlayer:
         self.process: subprocess.Popen | None = None
         self.decoder: subprocess.Popen | None = None
         self.track: Path | None = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.sink_monitor: threading.Thread | None = None
@@ -130,6 +140,95 @@ class ContinuousPcmPlayer:
         self.profile_attempt: tuple[int, int] | None = None
         self.profile_attempt_at = 0.0
         self.activation_requested = False
+        self.volume_profiles = VolumeProfiles(BASE_DIR / "config" / "audio_volume_profiles.json")
+        self.active_profile = None
+        self.playback_mode = None
+        self.generation = 0
+        self.quran_position = 0.0
+        self.last_quran_checkpoint = time.monotonic()
+        self.quran_checkpoint_thread = None
+        self.quran_artwork = None
+        self.quran_artwork_track = None
+        self.quran_timer = QuranTimer(BASE_DIR / "config" / "quran_timer.json")
+        self.quran = None
+        self.library_thread = None
+        try:
+            settings = json.loads((BASE_DIR / "config" / "quran_settings.json").read_text(encoding="utf-8"))
+            root = Path(settings["root"]).expanduser()
+            if not root.is_absolute():
+                raise ValueError("Qur'an root must be an absolute path")
+            self.quran = QuranController(root, self._start_quran, self._stop_quran,
+                                         BASE_DIR / "config" / "quran_settings.json")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logging.warning("Qur'an library is not configured: %s", exc)
+
+    def _start_quran(self, track: Path, position: float) -> None:
+        with self.lock:
+            if self.playback_mode == "athan":
+                raise RuntimeError("Athan is playing")
+            self.track = track
+            self.playback_mode = "quran"
+            self.quran_position = max(0.0, position)
+            self.generation += 1
+            self.activation_requested = True
+            if self.quran_artwork_track != track:
+                self._load_quran_artwork(track)
+
+    def _stop_quran(self) -> None:
+        with self.lock:
+            if self.playback_mode == "quran":
+                self.track = None
+                self.playback_mode = None
+                self.generation += 1
+
+    def _checkpoint_quran(self) -> None:
+        if self.quran is None or (self.quran_checkpoint_thread and self.quran_checkpoint_thread.is_alive()):
+            return
+        def worker():
+            try:
+                with self.lock:
+                    self.quran.save()
+            except (OSError, ValueError):
+                logging.exception("Could not save Qur'an playback position")
+        self.quran_checkpoint_thread = threading.Thread(target=worker, daemon=True)
+        self.quran_checkpoint_thread.start()
+
+    def _load_quran_artwork(self, track: Path) -> None:
+        self.quran_artwork = None
+        self.quran_artwork_track = track
+        def worker():
+            try:
+                if not self.quran or track.resolve().parent.parent != self.quran.root:
+                    raise ValueError("Artwork track escaped the Qur'an root")
+                artwork = extract_artwork(track, BASE_DIR / "cache" / "artwork")
+                with self.lock:
+                    if self.quran and self.quran.track and self.quran._find(self.quran.album, self.quran.track):
+                        current = self.quran._find(self.quran.album, self.quran.track)
+                        if Path(current["path"]) == track:
+                            self.quran_artwork = str(artwork) if artwork else None
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                logging.warning("Could not read embedded artwork for %s", track)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def refresh_quran_library(self) -> None:
+        if self.quran is None:
+            raise RuntimeError("Set the absolute Qur'an root in config/quran_settings.json")
+        if self.library_thread and self.library_thread.is_alive():
+            return
+        def worker():
+            try:
+                library = discover_library(self.quran.root)
+                if not library.get("error"):
+                    try:
+                        save_library(library, BASE_DIR / "cache" / "quran_library.json")
+                    except OSError:
+                        logging.exception("Could not save Qur'an library cache")
+                with self.lock:
+                    self.quran.install_library(library)
+            except Exception:
+                logging.exception("Qur'an library refresh failed")
+        self.library_thread = threading.Thread(target=worker, daemon=True)
+        self.library_thread.start()
 
     def start(self) -> None:
         self.process = subprocess.Popen(
@@ -143,6 +242,7 @@ class ContinuousPcmPlayer:
                 "--media-type", "Audio",
                 "--media-category", "Playback",
                 "--media-role", "Music",
+                "--properties", '{"application.name":"piAthan continuous stream"}',
                 "-",
             ],
             stdin=subprocess.PIPE,
@@ -160,6 +260,8 @@ class ContinuousPcmPlayer:
         self.worker.start()
         self.sink_monitor = threading.Thread(target=self._monitor_sink, daemon=True)
         self.sink_monitor.start()
+        if self.quran:
+            self.refresh_quran_library()
         logging.info("Continuous PipeWire PCM stream started")
 
     @staticmethod
@@ -340,7 +442,29 @@ class ContinuousPcmPlayer:
             "volume": volume.value,
             "volume_percent": round(volume.value * 100, 1),
             "muted": volume.muted,
+            "active_profile": self.active_profile,
         }
+
+    def profiles_status(self) -> dict:
+        return {"profiles": self.volume_profiles.snapshot(), "active_profile": self.active_profile}
+
+    def set_profile_volume(self, name: str, value: float) -> dict:
+        profiles = self.volume_profiles.set(name, value)
+        if self.active_profile == name:
+            self._apply_profile(name)
+        return {"profiles": profiles, "active_profile": self.active_profile}
+
+    def _apply_profile(self, name: str) -> None:
+        value = self.volume_profiles.snapshot()[name]
+        status = self._pipewire_status()
+        stream_id = self._find_stream(status) if status else None
+        if stream_id is None:
+            raise RuntimeError("Continuous Athan audio stream is unavailable")
+        result = subprocess.run([WPCTL, "set-volume", str(stream_id), f"{value:.3f}"],
+                                capture_output=True, text=True, timeout=5, check=False)
+        if result.returncode:
+            raise RuntimeError(f"Could not set {name} stream volume: {result.stderr.strip()}")
+        self.active_profile = name
 
     def set_volume(self, value: float) -> dict:
         sink = self._configured_sink()
@@ -414,29 +538,21 @@ class ContinuousPcmPlayer:
                 break
             if not in_streams:
                 continue
-            match = re.match(r"^\s*(\d+)\.\s+pw-cat\b", stripped)
+            match = re.search(r"\b(\d+)\.\s+piAthan continuous stream\b", stripped)
             if match:
                 return int(match.group(1))
         return None
 
     def _move_stream(self, stream_id: int, sink_id: int, sink_name: str) -> bool:
         try:
-            result = subprocess.run(
-                [WPCTL, "move", str(stream_id), str(sink_id)],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except OSError as exc:
+            inputs = parse_pactl_objects(run_pactl(["list", "sink-inputs"]), "Sink Input")
+            sinks = parse_pactl_objects(run_pactl(["list", "sinks"]), "Sink")
+            stream = resolve_pactl_index(inputs, stream_id)
+            sink = resolve_pactl_index(sinks, sink_id)
+            if stream["sink"] != sink["index"]:
+                run_pactl(["move-sink-input", str(stream["index"]), str(sink["index"])])
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             logging.warning("Could not move Athan stream to %s: %s", sink_name, exc)
-            return False
-        if result.returncode != 0:
-            logging.warning(
-                "Could not move Athan stream to %s: %s",
-                sink_name,
-                result.stderr.strip(),
-            )
             return False
         logging.info(
             "Athan stream routed to sink %s (sink=%d stream=%d)",
@@ -488,10 +604,10 @@ class ContinuousPcmPlayer:
                     )
             self.stop_event.wait(SINK_SCAN_INTERVAL)
 
-    def _start_decoder(self, track: Path) -> subprocess.Popen:
+    def _start_decoder(self, track: Path, position: float = 0.0) -> subprocess.Popen:
         return subprocess.Popen(
             [
-                FFMPEG, "-hide_banner", "-loglevel", "error", "-i", str(track),
+                FFMPEG, "-hide_banner", "-loglevel", "error", "-ss", str(position), "-i", str(track),
                 "-f", "s16le", "-acodec", "pcm_s16le",
                 "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "pipe:1",
             ],
@@ -503,16 +619,44 @@ class ContinuousPcmPlayer:
         if self.decoder is not None:
             if self.decoder.poll() is None:
                 self.decoder.terminate()
+                try:
+                    self.decoder.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.decoder.kill()
+                    self.decoder.wait(timeout=2)
             if self.decoder.stdout:
                 self.decoder.stdout.close()
+            if self.decoder.stderr:
+                self.decoder.stderr.close()
             self.decoder = None
 
     def _feed_stream(self) -> None:
         assert self.process is not None and self.process.stdin is not None
+        decoder_generation = None
         try:
             while not self.stop_event.is_set():
                 with self.lock:
+                    if self.quran_timer.expired():
+                        try:
+                            self.quran_timer.cancel()
+                        except OSError:
+                            self.quran_timer.deadline = None
+                            logging.exception("Could not save expired Qur'an timer")
+                        if self.quran:
+                            try:
+                                self.quran.pause()
+                            except OSError:
+                                logging.exception("Could not save stopped Qur'an state")
+                            self.quran.interrupted = False
+                        logging.info("Qur'an timer expired")
                     selected_track = self.track
+                    selected_mode = self.playback_mode
+                    selected_generation = self.generation
+                    selected_position = self.quran_position if selected_mode == "quran" else 0.0
+
+                if self.decoder is not None and decoder_generation != selected_generation:
+                    self._close_decoder()
+                    decoder_generation = None
 
                 if selected_track is None:
                     self._close_decoder()
@@ -521,23 +665,52 @@ class ContinuousPcmPlayer:
                     continue
 
                 if self.decoder is None:
-                    logging.info("Decoding Athan into continuous PCM stream: %s", selected_track)
-                    self.decoder = self._start_decoder(selected_track)
+                    try:
+                        self._apply_profile(selected_mode)
+                    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                        logging.error("Could not apply %s volume profile: %s", selected_mode, exc)
+                    logging.info("Decoding %s into continuous PCM stream: %s", selected_mode, selected_track)
+                    self.decoder = self._start_decoder(selected_track, selected_position)
+                    decoder_generation = selected_generation
 
                 pcm = self.decoder.stdout.read(SILENCE_FRAMES * BYTES_PER_FRAME)
                 if pcm:
+                    with self.lock:
+                        if selected_generation != self.generation:
+                            continue
                     self.process.stdin.write(pcm)
                     self.process.stdin.flush()
+                    if selected_mode == "quran":
+                        with self.lock:
+                            if selected_generation == self.generation:
+                                self.quran_position += len(pcm) / (SAMPLE_RATE * BYTES_PER_FRAME)
+                                self.quran.position = self.quran_position
+                                if time.monotonic() - self.last_quran_checkpoint >= 5:
+                                    self.last_quran_checkpoint = time.monotonic()
+                                    self._checkpoint_quran()
                     continue
 
                 error = self.decoder.stderr.read().decode(errors="replace").strip()
                 if error:
                     logging.error("FFmpeg decoding error: %s", error)
-                logging.info("Athan PCM playback finished: %s", selected_track)
+                logging.info("%s PCM playback finished: %s", selected_mode, selected_track)
                 self._close_decoder()
+                decoder_generation = None
                 with self.lock:
-                    if self.track == selected_track:
+                    if self.generation == selected_generation:
                         self.track = None
+                        self.playback_mode = None
+                        self.generation += 1
+                        if selected_mode == "athan" and self.quran:
+                            try:
+                                self.quran.athan_finished()
+                            except (ValueError, RuntimeError):
+                                logging.exception("Could not resume Qur'an after Athan")
+                        elif selected_mode == "quran" and self.quran:
+                            try:
+                                self.quran.next()
+                            except ValueError:
+                                self.quran.playing = False
         except (BrokenPipeError, OSError) as exc:
             logging.exception("Continuous PipeWire stream stopped: %s", exc)
         finally:
@@ -545,21 +718,57 @@ class ContinuousPcmPlayer:
 
     def play(self, track: Path) -> None:
         with self.lock:
-            self._close_decoder()
+            if self.playback_mode == "quran" and self.quran:
+                self.quran.athan_started(self.quran_position)
             self.track = track
+            self.playback_mode = "athan"
+            self.generation += 1
             self.activation_requested = True
+
+    def quran_status(self) -> dict:
+        if self.quran is None:
+            raise RuntimeError("Set the absolute Qur'an root in config/quran_settings.json")
+        status = self.quran.status()
+        def clock(seconds):
+            if seconds is None:
+                return "--:--"
+            seconds = max(0, int(seconds))
+            return f"{seconds // 60:02}:{seconds % 60:02}"
+        status["time_display"] = f"{clock(status['position'])} / {clock(status['duration'])}"
+        status["timer_active"] = self.quran_timer.deadline is not None
+        status["timer_duration_seconds"] = self.quran_timer.duration_seconds
+        status["timer_remaining_seconds"] = (max(0, int((self.quran_timer.deadline - datetime.now(timezone.utc)).total_seconds()))
+                                               if self.quran_timer.deadline else None)
+        status["artwork"] = self.quran_artwork
+        return status
 
     def silence(self) -> None:
         with self.lock:
-            self._close_decoder()
+            resume_quran = bool(self.playback_mode == "athan" and self.quran
+                                and self.quran.interrupted)
+            if self.playback_mode == "quran" and self.quran:
+                self.quran.playing = False
             self.track = None
+            self.playback_mode = None
+            self.generation += 1
             self.activation_requested = False
+            if resume_quran:
+                try:
+                    self.quran.athan_finished()
+                except (OSError, RuntimeError, ValueError):
+                    logging.exception("Could not resume Qur'an after Athan stopped")
 
     def stop(self) -> None:
         self.stop_event.set()
-        self._close_decoder()
         if self.process and self.process.poll() is None:
             self.process.terminate()
+
+    def check_health(self) -> None:
+        """Fail the service if its PCM producer or PipeWire process has died."""
+        if self.process is None or self.process.poll() is not None:
+            raise RuntimeError("Continuous PipeWire process is not running")
+        if self.worker is None or not self.worker.is_alive():
+            raise RuntimeError("Continuous PCM worker is not running")
 
 
 def send_response(connection: socket.socket, payload: dict) -> None:
@@ -576,12 +785,18 @@ def serve() -> None:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(str(CONTROL_SOCKET))
         server.listen(5)
+        server.settimeout(2)
         CONTROL_SOCKET.chmod(0o660)
         logging.info("Athan audio service ready: %s", CONTROL_SOCKET)
 
         while True:
-            connection, _ = server.accept()
+            player.check_health()
+            try:
+                connection, _ = server.accept()
+            except socket.timeout:
+                continue
             with connection:
+                connection.settimeout(5)
                 try:
                     line = connection.makefile(encoding="utf-8").readline()
                     request = json.loads(line)
@@ -598,6 +813,65 @@ def serve() -> None:
                             connection,
                             {"ok": True, "status": "ready", "audio_output": output},
                         )
+                    elif action == "volume_profiles_status":
+                        send_response(connection, {"ok": True, **player.profiles_status()})
+                    elif action in {"volume_profile_set", "volume_profile_step"}:
+                        profile = request.get("profile")
+                        if action == "volume_profile_set":
+                            value = request.get("value")
+                        else:
+                            delta = request.get("delta")
+                            if (isinstance(delta, bool) or not isinstance(delta, (int, float))
+                                    or not math.isfinite(delta)):
+                                raise ValueError("Volume delta must be a number")
+                            current = player.volume_profiles.snapshot().get(profile)
+                            if current is None:
+                                raise ValueError("Unknown volume profile")
+                            value = max(0.0, min(1.0, current + delta))
+                        send_response(connection, {"ok": True, **player.set_profile_volume(profile, value)})
+                    elif action == "quran_library":
+                        if player.quran is None:
+                            raise RuntimeError("Set the absolute Qur'an root in config/quran_settings.json")
+                        if request.get("refresh"):
+                            player.refresh_quran_library()
+                        with player.lock:
+                            library = player.quran.library
+                        send_response(connection, {"ok": True, "library": library})
+                    elif action.startswith("quran_"):
+                        if player.quran is None:
+                            raise RuntimeError("Set the absolute Qur'an root in config/quran_settings.json")
+                        with player.lock:
+                            if action == "quran_status":
+                                pass
+                            elif action == "quran_select":
+                                album = request.get("album")
+                                index = request.get("track")
+                                albums = [item for item in player.quran.library["albums"] if item["folder"] == album]
+                                if (not albums or isinstance(index, bool) or not isinstance(index, int)
+                                        or index < 0 or index >= len(albums[0]["tracks"])):
+                                    raise ValueError("Invalid Qur'an folder or track")
+                                player.quran.select(album, albums[0]["tracks"][index]["file"])
+                                player._load_quran_artwork(Path(albums[0]["tracks"][index]["path"]))
+                            elif action == "quran_play":
+                                player.quran.play()
+                            elif action == "quran_pause":
+                                player.quran.pause()
+                            elif action == "quran_stop":
+                                player.quran.stop_playback()
+                            elif action == "quran_previous":
+                                player.quran.previous()
+                            elif action == "quran_next":
+                                player.quran.next()
+                            elif action == "quran_timer_set":
+                                player.quran_timer.configure(request.get("hours"), request.get("minutes"))
+                            elif action == "quran_timer_start":
+                                player.quran_timer.start()
+                            elif action == "quran_timer_cancel":
+                                player.quran_timer.cancel()
+                            else:
+                                raise ValueError(f"Unknown action: {action!r}")
+                            quran_status = player.quran_status()
+                        send_response(connection, {"ok": True, "quran": quran_status})
                     elif action == "volume_status":
                         send_response(
                             connection,
@@ -639,8 +913,9 @@ def serve() -> None:
                         send_response(connection, {"ok": True, "status": "playing"})
                     elif action == "stop":
                         player.silence()
-                        logging.info("Athan playback stopped; continuous stream retained")
-                        send_response(connection, {"ok": True, "status": "silence"})
+                        resumed = player.playback_mode == "quran"
+                        logging.info("Athan playback stopped; continuous stream retained; quran_resumed=%s", resumed)
+                        send_response(connection, {"ok": True, "status": "quran_resumed" if resumed else "silence"})
                     else:
                         raise ValueError(f"Unknown action: {action!r}")
                 except Exception as exc:

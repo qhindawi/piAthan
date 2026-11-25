@@ -55,7 +55,26 @@ sudo apt update
 sudo apt install -y python3 ffmpeg pipewire pipewire-pulse wireplumber pipewire-bin libspa-0.2-bluetooth pulseaudio-utils
 ```
 
-The Pi must have internet access, a working PipeWire session for the service user, the two MP3 files in `audio/`, and a configured default PipeWire output device. No third-party Python packages are required.
+The Pi must have internet access, a working PipeWire session for the service user, the two MP3 files in `audio/`, and a configured default PipeWire output device. The dashboard also requires PyQt5 Qt Quick, its QML modules, and `python3-pypdf` for the Mawaqit Hijri calendar PDF.
+
+## Touchscreen and remote desktop
+
+The verified graphical session uses labwc on Wayland. The physical touchscreen is `HDMI-A-1` (1024×600) and the dashboard setting `config/dashboard.json` must specify `"physical_output": "HDMI-A-1"`. The dashboard refuses to open if the configured screen is unavailable. Preserve the existing labwc touchscreen mapping (`yldzkj USB2IIC_CTP_CONTROL` to `HDMI-A-1`).
+
+The virtual output `NOOP-remote` was created using the Super+V binding prepared by `src/prepare_virtual_output.py`; the physical output remained at (0,0) and the virtual output appeared at (1024,0). The preparation script previews changes by default; `--apply` writes a backup and updates the existing labwc config. Run `labwc --reconfigure`, then press Super+V once. Check `wlr-randr` before continuing; repeated key presses can create extra outputs.
+
+The Pi has two separate WayVNC servers. VNC Viewer connects to the system server at `/tmp/wayvnc/wayvncctl.sock`, whereas Raspberry Pi Connect uses `/run/user/1000/rpi-connect-wayvnc-ctl.sock`. To inspect and switch the VNC Viewer server:
+
+```bash
+sudo wayvncctl --socket=/tmp/wayvnc/wayvncctl.sock output-list
+sudo wayvncctl --socket=/tmp/wayvnc/wayvncctl.sock output-set NOOP-remote
+```
+
+In Desktop Preferences, select `NOOP-remote` as the taskbar display. To restore the VNC view to the physical screen from SSH or the touchscreen, use `sudo wayvncctl --socket=/tmp/wayvnc/wayvncctl.sock output-set HDMI-A-1`. Reboot persistence of the virtual display and output selection has not yet been verified or automated; check it after reboot. Do not change VNC authentication or touchscreen mapping. Both outputs share a desktop session and input focus.
+
+The dashboard user service is separate from the scheduler and continuous audio service. The Qur'an folder and physical output are configured with `config/quran_settings.json` and `config/dashboard.json`; example files are provided. Weather uses a separate service and cached data. The mosque's published PDF provides Hijri dates, merged into the prayer calendar by date; future dates may be adjusted by the source.
+
+The user service `user-services/piathan-dashboard.service` uses the observed `wayland-0` socket and starts the dashboard independently of a terminal. It retries when the graphical session is not ready. Enable desktop autologin for qais so the graphical session starts after reboot; user lingering alone does not start a desktop. Install the unit under `~/.config/systemd/user/`, run `systemctl --user daemon-reload` and `systemctl --user enable --now piathan-dashboard.service`. The configured `HDMI-A-1` screen is selected and the client opens fullscreen. Inspect it with `systemctl --user status piathan-dashboard.service` and `journalctl --user -u piathan-dashboard.service -b --no-pager`. The `wayland-0` socket was observed on this Pi; adjust the unit if the compositor uses a different socket. Verify startup after an actual reboot.
 
 ## Install on the Pi
 
@@ -64,7 +83,7 @@ The project is designed to be copied as one folder into the target user’s home
 From Windows PowerShell, copy the complete project folder to the Pi. Replace `PI_IP` with the Pi’s hostname or IP address:
 
 ```powershell
-scp -r "C:\Users\qais_\Documents\ChatGPT\piAthan" qais@PI_IP:/home/qais/
+scp -r "C:\Users\qais_\Documents\GitHub\piAthan" qais@PI_IP:/home/qais/
 ```
 
 Then connect to the Pi and enter the copied project:
